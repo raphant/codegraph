@@ -27,7 +27,7 @@ import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, loadMaxFileSize, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -152,11 +152,14 @@ export function hashContent(content: string): string {
 }
 
 /**
- * Skip files larger than this (bytes). Generated bundles, minified JS, and
- * vendored blobs blow the WASM heap and the worker-recycle budget for no useful
- * symbols. 1 MB covers essentially all hand-written source.
+ * The size error for a skipped file. Files larger than `loadMaxFileSize` (1 MB
+ * unless `codegraph.json` sets `maxFileSizeMB`) are skipped: generated bundles,
+ * minified JS, and vendored blobs blow the WASM heap and the worker-recycle
+ * budget for no useful symbols.
  */
-const MAX_FILE_SIZE = 1024 * 1024;
+function sizeExceededMessage(size: number, max: number): string {
+  return `File exceeds max size (${size} > ${max}); set "maxFileSizeMB" in ${PROJECT_CONFIG_FILENAME} to index it`;
+}
 
 /**
  * Directory names that are dependency, build, cache, or tooling output across the
@@ -2280,18 +2283,18 @@ export class ExtractionOrchestrator {
           continue;
         }
 
-        // Honour MAX_FILE_SIZE. Without this check, vendored generated
+        // Honour the max file size. Without this check, vendored generated
         // headers, minified bundles, and other multi-MB files get indexed,
         // wasting WASM heap and the worker recycle budget on inputs with no
         // useful symbols. The single-file extractFile path already enforces
         // this; the bulk path used to silently skip the check.
-        if (stats.size > MAX_FILE_SIZE) {
+        if (stats.size > loadMaxFileSize(this.rootDir)) {
           await storeResult(filePath, content, stats, {
             nodes: [],
             edges: [],
             unresolvedReferences: [],
             errors: [{
-              message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
+              message: sizeExceededMessage(stats.size, loadMaxFileSize(this.rootDir)),
               filePath,
               severity: 'warning',
               code: 'size_exceeded',
@@ -2621,14 +2624,14 @@ export class ExtractionOrchestrator {
     const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
 
     // Check file size
-    if (stats.size > MAX_FILE_SIZE) {
+    if (stats.size > loadMaxFileSize(this.rootDir)) {
       const result: ExtractionResult = {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
         errors: [
           {
-            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
+            message: sizeExceededMessage(stats.size, loadMaxFileSize(this.rootDir)),
             filePath: relativePath,
             severity: 'warning',
             code: 'size_exceeded',

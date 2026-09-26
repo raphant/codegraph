@@ -2,7 +2,7 @@
  * Project-scoped configuration: a committed `codegraph.json` at the project
  * root that a team shares through version control.
  *
- * Today it carries one thing — `extensions`, an opt-in map from a custom file
+ * Its first field was `extensions`, an opt-in map from a custom file
  * extension to one of CodeGraph's supported languages. The built-in
  * extension → language table (`EXTENSION_MAP` in `extraction/grammars.ts`) is
  * otherwise hardcoded, so a codebase that uses a non-standard extension for a
@@ -82,7 +82,17 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /**
+   * Largest file to index, in megabytes (default 1). Bigger files are stored
+   * with a `size_exceeded` warning and no symbols. The default keeps generated
+   * bundles out; raise it when a hand-written file is bigger (a 1.1 MB
+   * `heartbeat.ts` holding a server's core loop).
+   */
+  maxFileSizeMB?: number;
 }
+
+/** Largest file indexed when `codegraph.json` sets no `maxFileSizeMB`. */
+export const DEFAULT_MAX_FILE_SIZE = 1024 * 1024;
 
 /** Parsed, validated view of a project's `codegraph.json`. */
 interface ParsedConfig {
@@ -91,6 +101,8 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  /** `maxFileSizeMB` in bytes. */
+  maxFileSize: number;
 }
 
 interface CacheEntry {
@@ -114,6 +126,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  maxFileSize: DEFAULT_MAX_FILE_SIZE,
 });
 
 /**
@@ -167,16 +180,32 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const maxFileSize = extractMaxFileSize(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    maxFileSize === DEFAULT_MAX_FILE_SIZE
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, maxFileSize };
+}
+
+/**
+ * Validate `maxFileSizeMB`: a positive number of megabytes. Anything else
+ * warns and keeps the default; never throws.
+ */
+function extractMaxFileSize(parsed: object, file: string): number {
+  const raw = (parsed as ProjectConfig).maxFileSizeMB;
+  if (raw === undefined) return DEFAULT_MAX_FILE_SIZE;
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) {
+    logWarn(`Ignoring "maxFileSizeMB" in ${PROJECT_CONFIG_FILENAME}: must be a positive number of megabytes`, { file });
+    return DEFAULT_MAX_FILE_SIZE;
+  }
+  return Math.floor(raw * 1024 * 1024);
 }
 
 /**
@@ -341,6 +370,14 @@ function loadParsedConfig(rootDir: string): ParsedConfig {
  */
 export function loadExtensionOverrides(rootDir: string): Record<string, Language> {
   return loadParsedConfig(rootDir).extensions;
+}
+
+/**
+ * The largest file, in bytes, the extractor indexes for a project, mtime-cached.
+ * `DEFAULT_MAX_FILE_SIZE` unless `codegraph.json` sets `maxFileSizeMB`.
+ */
+export function loadMaxFileSize(rootDir: string): number {
+  return loadParsedConfig(rootDir).maxFileSize;
 }
 
 /**

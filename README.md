@@ -653,6 +653,9 @@ What it skips out of the box:
 - **Anything in your `.gitignore`** — honored in git repos via git, and in
   non-git projects by reading `.gitignore` directly (root and nested).
 - **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs.
+  A hand-written file can be bigger; raise the limit with `maxFileSizeMB` in
+  `codegraph.json` (for example `{ "maxFileSizeMB": 2 }`), then run
+  `codegraph index` again.
 
 To keep something else out, add it to `.gitignore`. To pull a default-excluded
 directory back **in** (say you really do want a vendored dependency indexed),
