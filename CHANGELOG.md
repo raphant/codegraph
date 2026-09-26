@@ -147,6 +147,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
+- **CodeIgniter model and library calls are linked.** A call like `$this->attendance_model->mark_present()` goes through a property CodeIgniter's loader creates at runtime, so nothing declared its type and the call was never linked — callers, impact and the blast radius in `codegraph_explore` said nothing used those methods. CodeIgniter projects now link these calls to the model or library they load.
+
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
 - Calls between JavaScript, JSX and TypeScript files keep their callers and callback flows.
