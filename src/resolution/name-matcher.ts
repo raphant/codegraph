@@ -157,6 +157,17 @@ export function sameLanguageFamily(a: string, b: string): boolean {
   return fa !== undefined && fa === LANGUAGE_FAMILY[b];
 }
 /**
+ * True when the project itself declares a type named `typeName` (last segment
+ * of a dotted name) in `language`'s family. matchMethodCall uses it to tell a
+ * receiver typed by the project from one typed by a library (`Stream`, `List`).
+ */
+function isProjectTypeName(typeName: string, language: Language, context: ResolutionContext): boolean {
+  const simple = typeName.split('.').pop() ?? typeName;
+  return context
+    .getNodesByName(simple)
+    .some((n) => SUPERTYPE_TARGET_KINDS.has(n.kind) && sameLanguageFamily(n.language, language));
+}
+/**
  * True when `lang` belongs to a known multi-language family (jvm/apple/web/c).
  * Languages not listed (php, python, go, ruby, rust, dart, …) and config
  * formats (yaml/xml/blade) form their own singleton families and return
@@ -2409,6 +2420,14 @@ export function matchMethodCall(
         ESM_FAMILY.has(ref.language) &&
         (JS_BUILT_INS.has(inferredType) || TS_PRIMITIVE_TYPES.has(inferredType))
       ) {
+        return null;
+      }
+      // The same rule for every other language, without a builtin list: a
+      // declared type the project does not define is a library type (C#
+      // `Stream stream`, `var found = new List<Def>()`), so its methods live in
+      // that library. Strategy 2/3 below would hand `stream.Read()` to the
+      // project's lone `Read` and `found.Add()` to a project class `Found`.
+      if (!ESM_FAMILY.has(ref.language) && !isProjectTypeName(inferredType, ref.language, context)) {
         return null;
       }
     }
