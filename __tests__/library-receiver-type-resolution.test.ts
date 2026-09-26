@@ -131,4 +131,120 @@ namespace App {
     const calls = await load();
     expect(callsFrom(calls, 'render')).toEqual([]);
   });
+
+  // A library type reaches project code only through an extension method.
+  it('C#: an extension method on a library type still links', async () => {
+    write('Ext.cs', `namespace App {
+  public static class ServiceExtensions {
+    public static IServiceCollection AddCore(this IServiceCollection services) { return services; }
+  }
+}
+`);
+    write('Startup.cs', `namespace App {
+  public class Startup {
+    public void Configure(IServiceCollection services) { services.AddCore(); }
+    public void Chain(Builder builder) { builder.Services.AddCore(); }
+  }
+}
+`);
+    const calls = await load();
+    expect(callsFrom(calls, 'Configure')).toEqual(['App::ServiceExtensions::AddCore']);
+    expect(callsFrom(calls, 'Chain')).toEqual(['App::ServiceExtensions::AddCore']);
+  });
+
+  it('Dart: an extension on a library type still links', async () => {
+    write('lib/ext.dart', `extension Slug on String { String slugify() => this; }
+`);
+    write('lib/use.dart', `class Use { String run(String title) { String t = title; return t.slugify(); } }
+`);
+    const calls = await load();
+    expect(callsFrom(calls, 'run')).toEqual(['Slug::slugify']);
+  });
+});
+
+describe('the name guess needs a receiver it can read', () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'guess-recv-')); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  const write = (rel: string, body: string) => {
+    const p = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, body);
+  };
+  // Index once, then list each named caller's method targets.
+  const indexCalls = async () => {
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const rows: { src: string; tgtQn: string }[] = (cg as any).db.db
+      .prepare(
+        `SELECT s.name src, t.qualified_name tgtQn FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+         WHERE e.kind = 'calls' AND t.kind = 'method'`,
+      )
+      .all();
+    cg.close?.();
+    return (src: string) => rows.filter((r) => r.src === src).map((r) => r.tgtQn);
+  };
+  const callsFrom = async (src: string) => (await indexCalls())(src);
+
+  const frame = `namespace App {
+  public class Frame { public static void Write(byte[] b) { } }
+}
+`;
+
+  it('C#: a static call on a library class does not link', async () => {
+    write('Frame.cs', frame);
+    write('Bridge.cs', `namespace App {
+  public class Bridge { static int last; static void Pump() { System.Threading.Volatile.Write(ref last, 1); Volatile.Write(ref last, 2); } }
+}
+`);
+    expect(await callsFrom('Pump')).toEqual([]);
+  });
+
+  it('C#: a call on a property chain does not link', async () => {
+    write('Frame.cs', frame);
+    write('Server.cs', `namespace App {
+  public class Server { static void Reply(HttpListenerContext context, byte[] bytes) { context.Response.OutputStream.Write(bytes, 0, bytes.Length); } }
+}
+`);
+    expect(await callsFrom('Reply')).toEqual([]);
+  });
+
+  it('C#: base.M() inside an override does not link the method to itself', async () => {
+    write('Settings.cs', `namespace App {
+  public class Settings : ModSettings { public override void ExposeData() { base.ExposeData(); } }
+}
+`);
+    expect(await callsFrom('ExposeData')).toEqual([]);
+  });
+
+  it('Java: super.m() still links to a parent method the class does not override', async () => {
+    write('src/Base.java', `public class Base { protected void helper() { } }
+`);
+    write('src/Child.java', `public class Child extends Base { void run() { super.helper(); } }
+`);
+    expect(await callsFrom('run')).toEqual(['Base::helper']);
+  });
+
+  it('Java: a static method on a project enum and a chain rooted at a project type still link', async () => {
+    write('src/Policy.java', `public enum Policy {
+  UPPER;
+  static String separate(String s) { return s; }
+  Style style() { return null; }
+}
+`);
+    write('src/Style.java', `public class Style {
+  public static final Style COMPACT = new Style();
+  public Style withNewline(String s) { return this; }
+}
+`);
+    write('src/Use.java', `public class Use {
+  String a() { return Policy.separate("x"); }
+  Style b() { return Style.COMPACT.withNewline(""); }
+}
+`);
+    const from = await indexCalls();
+    expect(from('a')).toEqual(['Policy::separate']);
+    expect(from('b')).toEqual(['Style::withNewline']);
+  });
 });

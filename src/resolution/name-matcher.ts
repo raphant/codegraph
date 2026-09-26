@@ -167,6 +167,101 @@ function isProjectTypeName(typeName: string, language: Language, context: Resolu
     .getNodesByName(simple)
     .some((n) => SUPERTYPE_TARGET_KINDS.has(n.kind) && sameLanguageFamily(n.language, language));
 }
+
+/**
+ * `receiver.method()` on a receiver whose declared type (`typeName`) comes from
+ * a library: link it only to a project EXTENSION method of that name, the one
+ * way a library type reaches project code. One extension of the name links;
+ * several prefer those declared for `typeName`, then the call-site file.
+ */
+function resolveExtensionMethod(
+  typeName: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const simple = typeName.split('.').pop() ?? typeName;
+  const extensions = context
+    .getNodesByName(methodName)
+    .filter((n) => n.kind === 'method' && n.name === methodName && sameLanguageFamily(n.language, ref.language))
+    .map((n) => ({ n, on: extendedTypeOf(n, context) }))
+    .filter((e): e is { n: Node; on: string } => e.on !== null);
+  if (extensions.length === 0) return null;
+  const forType = extensions.filter((e) => e.on === simple);
+  const pool = forType.length > 0 ? forType : extensions;
+  const picked = pool.length === 1 ? pool[0] : pool.filter((e) => e.n.filePath === ref.filePath);
+  const target = Array.isArray(picked) ? (picked.length === 1 ? picked[0] : undefined) : picked;
+  if (!target) return null;
+  return { original: ref, targetNodeId: target.n.id, confidence: 0.85, resolvedBy: 'instance-method' };
+}
+
+/** Languages where a capitalized receiver names a type, not a variable. */
+const TYPE_CASED_LANGUAGES = new Set<string>(['csharp', 'java', 'kotlin', 'scala', 'swift', 'dart']);
+
+/**
+ * Whether matchMethodCall's name guess may use `receiver`. Outside the
+ * type-cased languages, always. Inside them: a plain variable (`frame`,
+ * `this.frame`), `base`/`super`, a capitalized name the project declares as a
+ * type (a Java enum's static method) or as a field/property/variable/constant
+ * (a C# property), or a chain rooted at a
+ * project type (`DateType.DATE.createAdapterFactory`). Not another chain
+ * (`ctx.Response.OutputStream`), and not a capitalized name the project does
+ * not declare — a library class (`Volatile`, `Arrays`).
+ */
+function isGuessableReceiver(receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!TYPE_CASED_LANGUAGES.has(ref.language)) return true;
+  const name = receiver.startsWith('this.') ? receiver.slice(5) : receiver;
+  if (name.includes('.')) {
+    const root = name.split('.')[0]!;
+    return /^[A-Z]/.test(root) && isProjectTypeName(root, ref.language, context);
+  }
+  if (!/^[A-Z]/.test(name)) return true;
+  return context
+    .getNodesByName(name)
+    .some((n) =>
+      (SUPERTYPE_TARGET_KINDS.has(n.kind) ||
+        n.kind === 'field' || n.kind === 'property' || n.kind === 'variable' || n.kind === 'constant') &&
+      sameLanguageFamily(n.language, ref.language));
+}
+
+/** `A::B` for a ref made inside a member of class `A::B`, else null. */
+function enclosingClassQualifiedName(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const from = context.getNodeById?.(ref.fromNodeId);
+  if (!from) return null;
+  const parts = from.qualifiedName.split('::');
+  return parts.length > 1 ? parts.slice(0, -1).join('::') : null;
+}
+
+/** C# `static R Name(this T x …)` → the extended type's simple name. */
+const CSHARP_EXTENSION_PARAM = /\w\s*(?:<[^>]*>)?\s*\(\s*this\s+([\w.]+)/;
+/** Dart `extension [Name] on T` → the extended type. */
+const DART_EXTENSION_DECL = /\bextension\b(?:\s+\w+)?(?:\s*<[^>]*>)?\s+on\s+([\w.]+)/;
+
+/**
+ * The simple name of the type `method` extends, or null when it is not an
+ * extension method. Read from source: C# marks the first parameter `this`;
+ * Dart indexes an extension as a class whose declaration says `on T`.
+ */
+function extendedTypeOf(method: Node, context: ResolutionContext): string | null {
+  const lines = context.getFileLines?.(method.filePath) ?? context.readFile(method.filePath)?.split(/\r?\n/);
+  if (!lines) return null;
+  const simpleName = (t: string) => t.split('.').pop()!;
+  if (method.language === 'csharp') {
+    const decl = lines.slice(method.startLine - 1, method.startLine + 2).join(' ');
+    const m = decl.match(CSHARP_EXTENSION_PARAM);
+    return m ? simpleName(m[1]!) : null;
+  }
+  if (method.language === 'dart') {
+    const containerName = method.qualifiedName.split('::').slice(-2, -1)[0];
+    if (!containerName) return null;
+    const container = context
+      .getNodesInFile(method.filePath)
+      .find((n) => n.kind === 'class' && n.name === containerName && n.startLine <= method.startLine);
+    const m = container && lines[container.startLine - 1]?.match(DART_EXTENSION_DECL);
+    return m ? simpleName(m[1]!) : null;
+  }
+  return null;
+}
 /**
  * True when `lang` belongs to a known multi-language family (jvm/apple/web/c).
  * Languages not listed (php, python, go, ruby, rust, dart, …) and config
@@ -2427,8 +2522,11 @@ export function matchMethodCall(
       // `Stream stream`, `var found = new List<Def>()`), so its methods live in
       // that library. Strategy 2/3 below would hand `stream.Read()` to the
       // project's lone `Read` and `found.Add()` to a project class `Found`.
+      // The one way a library type reaches project code is an extension
+      // method (C# `this IServiceCollection services`, Dart `extension on`),
+      // so only those stay candidates.
       if (!ESM_FAMILY.has(ref.language) && !isProjectTypeName(inferredType, ref.language, context)) {
-        return null;
+        return resolveExtensionMethod(inferredType, methodName!, ref, context);
       }
     }
   }
@@ -2625,8 +2723,21 @@ export function matchMethodCall(
     if (methodCandidates.length > AMBIGUOUS_NAME_CEILING) {
       return null;
     }
+    // In languages where a capitalized receiver is a type, a receiver that is
+    // not a plain variable says nothing the name guess can use: a library
+    // class (`Volatile.Write`) or a property chain (`ctx.Response.OutputStream
+    // .Write`) only reaches project code through an extension method.
+    if (!isGuessableReceiver(objectOrClass!, ref, context)) {
+      return resolveExtensionMethod('', methodName!, ref, context);
+    }
+    // `base.M()` / `super.M()` calls the parent class, never the caller's own
+    // class — the lone same-named method is usually the calling override itself.
+    const ownClass = objectOrClass === 'base' || objectOrClass === 'super'
+      ? enclosingClassQualifiedName(ref, context)
+      : null;
     const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName
+      (n) => n.kind === 'method' && n.name === methodName &&
+        !(ownClass && n.qualifiedName.startsWith(`${ownClass}::`))
     );
 
     // Filter to same-language candidates first
