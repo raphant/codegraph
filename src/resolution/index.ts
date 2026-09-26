@@ -19,7 +19,7 @@ import {
   isInheritanceRef,
   isImportableKind,
 } from './types';
-import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isFactoryBoundMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -941,7 +941,8 @@ export class ReferenceResolver {
       isNixPathImportRef(ref) ||
       this.hasAnyPossibleMatch(existenceName) ||
       this.matchesAnyImport(ref) ||
-      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
+      this.frameworks.some((f) => f.claimsReference?.(ref.referenceName)) ||
+      isFactoryBoundMemberCall(ref, this.context);
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);

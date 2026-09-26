@@ -1971,6 +1971,24 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
 }
 
 /** 1-based start line of the tightest function/method enclosing the call. */
+/**
+ * Start lines of every function or method around the ref, innermost first.
+ * JS/TS closures see their outer functions' variables, so the receiver-type
+ * scan retries each outer scope in turn (a factory's returned
+ * `closeStream: () => turn.closeStream()` reads `let turn: Turn` declared in
+ * the factory).
+ */
+function enclosingScopeStartLines(ref: UnresolvedRef, context: ResolutionContext): number[] {
+  const starts = new Set<number>();
+  for (const n of context.getNodesInFile(ref.filePath)) {
+    if (n.kind !== 'function' && n.kind !== 'method') continue;
+    if (n.language !== ref.language) continue;
+    const end = n.endLine ?? n.startLine;
+    if (n.startLine <= ref.line && end >= ref.line) starts.add(n.startLine);
+  }
+  return [...starts].sort((a, b) => b - a);
+}
+
 function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext): number {
   let start = 1;
   for (const n of context.getNodesInFile(ref.filePath)) {
@@ -1988,12 +2006,15 @@ function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext)
  * Infer a receiver's type from its local declaration/initializer in the
  * enclosing function body. Language-dispatched; returns null for languages
  * without patterns or when no declaration is found. Bounded to the enclosing
- * scope so a same-named variable in another function can't leak in.
+ * scope so a same-named variable in another function can't leak in;
+ * `scopeStartLine` widens it to an outer function (JS/TS closures, see
+ * enclosingScopeStartLines).
  */
 function inferLocalReceiverType(
   receiverName: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
+  scopeStartLine?: number,
 ): string | null {
   // CFML scope prefixes: `variables.svc` / `this.svc` name a COMPONENT-scoped
   // field whose assignment or `property` declaration usually lives outside the
@@ -2050,7 +2071,7 @@ function inferLocalReceiverType(
   const callIdx = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
   const startIdx = componentScoped
     ? 0
-    : Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+    : Math.max(0, (scopeStartLine ?? enclosingScopeStartLine(ref, context)) - 1);
 
   const matchLine = (i: number): string | null => {
     const line = lines[i];
@@ -2140,6 +2161,103 @@ function inferLocalReceiverType(
     return inferPhpAssignedPropertyType(escapedReceiver, lines, callIdx);
   }
   return null;
+}
+
+/** The calling file's `const NAME = callee(…)` bindings, cached per file. */
+function factoryBindings(ref: UnresolvedRef, context: ResolutionContext): Map<string, string[]> {
+  let files = FACTORY_BINDINGS.get(context);
+  if (!files) { files = new Map(); FACTORY_BINDINGS.set(context, files); }
+  let bindings = files.get(ref.filePath);
+  if (!bindings) {
+    bindings = new Map();
+    const code = blankStringContents(stripCommentsForRegex(context.readFile(ref.filePath) ?? '', 'typescript'));
+    for (const m of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*\(/g)) {
+      const callees = bindings.get(m[1]!) ?? [];
+      if (!callees.includes(m[2]!)) callees.push(m[2]!);
+      bindings.set(m[1]!, callees);
+    }
+    if (files.size >= 256) files.delete(files.keys().next().value!);
+    files.set(ref.filePath, bindings);
+  }
+  return bindings;
+}
+
+/**
+ * True for a JS/TS `receiver.method` call whose receiver the file binds from a
+ * call (`const svc = issueService(db)`). The resolver's name pre-check lets
+ * these through: with a renamed factory entry (`getById: getProjectById`) no
+ * symbol is named `getById` at all.
+ */
+export function isFactoryBoundMemberCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.referenceKind !== 'calls' || !ESM_FAMILY.has(ref.language)) return false;
+  const m = /^([A-Za-z_$][\w$]*)\.[A-Za-z_$][\w$]*$/.exec(ref.referenceName);
+  return !!m && factoryBindings(ref, context).has(m[1]!);
+}
+
+/**
+ * The function a factory returns under `key`: its own `factory::key` node, or,
+ * for a renamed entry (`getById: getProjectById,` on its own line in the
+ * factory), the function that name points at — `factory::getProjectById` or a
+ * top-level `getProjectById` in the same file.
+ */
+function factoryMember(factory: Node, key: string, context: ResolutionContext): Node | null {
+  const fns = context.getNodesInFile(factory.filePath).filter((n) => n.kind === 'function');
+  const own = fns.find((n) => n.qualifiedName === `${factory.qualifiedName}::${key}`);
+  if (own) return own;
+  const lines = context.getFileLines
+    ? context.getFileLines(factory.filePath)
+    : (context.readFile(factory.filePath)?.split(/\r?\n/) ?? null);
+  if (!lines) return null;
+  const entry = new RegExp(`^\\s*${key}\\s*:\\s*([A-Za-z_$][\\w$]*)\\s*,?\\s*$`);
+  for (let i = factory.startLine; i < (factory.endLine ?? factory.startLine); i++) {
+    const target = lines[i]?.match(entry)?.[1];
+    if (!target) continue;
+    return fns.find((n) => n.qualifiedName === `${factory.qualifiedName}::${target}`)
+      ?? fns.find((n) => n.qualifiedName === target)
+      ?? null;
+  }
+  return null;
+}
+
+/** Per file: receiver name → the callees it is bound from (`const svc = issueService(db)`). */
+const FACTORY_BINDINGS = new WeakMap<ResolutionContext, Map<string, Map<string, string[]>>>();
+
+/**
+ * `svc.getById()` where `svc` is bound from a call to a project function —
+ * `const svc = issueService(db)` — links to the function that factory returns
+ * under that key: `issueService::getById`, a node the extractor makes from the
+ * factory's `return { getById: async (id) => {…} }` or `return { getById }`.
+ * Bindings are read from the calling file's source in any scope (routes bind
+ * services once at the top of a route factory). When the file's bindings of
+ * the name lead to more than one target, nothing links. Awaited bindings are
+ * `inferEsmAwaitedCallType`'s. JS/TS only.
+ */
+function matchFactoryMemberCall(
+  receiver: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const callees = factoryBindings(ref, context).get(receiver);
+  if (!callees) return null;
+
+  const imports = context.getImportMappings(ref.filePath, ref.language);
+  const targets = new Set<string>();
+  for (const callee of callees) {
+    let factory: Node | null | undefined;
+    if (imports.some((m) => m.localName === callee)) {
+      const resolved = context.resolveImport?.({ ...ref, referenceName: callee, referenceKind: 'calls' });
+      factory = resolved ? context.getNodeById?.(resolved.targetNodeId) : null;
+    } else {
+      const local = context.getNodesByName(callee).filter((n) => n.kind === 'function' && n.filePath === ref.filePath);
+      factory = local.length === 1 ? local[0] : null;
+    }
+    if (!factory || factory.kind !== 'function') continue;
+    const member = factoryMember(factory, methodName, context);
+    if (member) targets.add(member.id);
+  }
+  if (targets.size !== 1) return null;
+  return { original: ref, targetNodeId: [...targets][0]!, confidence: 0.9, resolvedBy: 'instance-method' };
 }
 
 /** Infer only a visible awaited binding and its actual local/imported callee.
@@ -2471,6 +2589,12 @@ export function matchMethodCall(
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context)
         : inferLocalReceiverType(objectOrClass!, ref, context));
+    if (!inferredType && ESM_FAMILY.has(ref.language)) {
+      for (const start of enclosingScopeStartLines(ref, context).slice(1)) {
+        inferredType = inferLocalReceiverType(objectOrClass!, ref, context, start);
+        if (inferredType) break;
+      }
+    }
     const awaited = !inferredType && ESM_FAMILY.has(ref.language)
       ? inferEsmAwaitedCallType(objectOrClass!, ref, context) : null;
     if (awaited) {
@@ -2529,6 +2653,13 @@ export function matchMethodCall(
         return resolveExtensionMethod(inferredType, methodName!, ref, context);
       }
     }
+  }
+
+  // `svc.getById()` where `const svc = issueService(db)`: the method is the
+  // function the factory returns under that key.
+  if (dotMatch && ESM_FAMILY.has(ref.language) && !objectOrClass!.includes('.')) {
+    const factoryMember = matchFactoryMemberCall(objectOrClass!, methodName!, ref, context);
+    if (factoryMember) return factoryMember;
   }
 
   // Go 2-hop field chain `base.field.Method` (#1276): the base's type comes

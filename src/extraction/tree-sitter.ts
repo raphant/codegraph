@@ -2571,6 +2571,84 @@ export class TreeSitterExtractor {
     return this.vueStoreFile;
   }
 
+  /** True for an object member that is an inline function: `key: () => …`,
+   *  `key: function () {…}`, or method shorthand `key() {…}`. */
+  private isInlineObjectFunction(member: SyntaxNode): boolean {
+    if (member.type === 'method_definition') return true;
+    if (member.type !== 'pair') return false;
+    const v = getChildByField(member, 'value');
+    return v?.type === 'arrow_function' || v?.type === 'function_expression';
+  }
+
+  /**
+   * The object a JS/TS `return` statement hands back when it is a factory's
+   * object of functions: the value is an object literal with at least one
+   * inline function, and the nearest enclosing function has a node of its own
+   * (a named function, or `const f = () => {…}`). Anonymous callbacks
+   * (`rows.map((r) => { return {…} })`) and class methods return null.
+   * Mirrored by the kernel's `factory_returned_object`.
+   */
+  private factoryReturnedObject(ret: SyntaxNode): SyntaxNode | null {
+    if (!TS_JS_CHAIN_LANGUAGES.has(this.language)) return null;
+    const value = this.unwrapParens(ret.namedChild(0));
+    if (value?.type !== 'object' || !this.objectHasInlineFunctions(value)) return null;
+    let fn = ret.parent;
+    while (fn && fn.type !== 'method_definition' && !this.extractor!.functionTypes.includes(fn.type)) fn = fn.parent;
+    return fn && this.isFactoryFunction(fn) ? value : null;
+  }
+
+  /**
+   * The object of a `const NAME = {…}` that sits directly in a factory's body
+   * and is what the factory returns: `return NAME;`, or `return ALIAS;` after
+   * `const ALIAS = NAME as Api;`. Null for any other declarator. Mirrored by
+   * the kernel's `factory_returned_local_object`.
+   */
+  private factoryReturnedLocalObject(declarator: SyntaxNode): SyntaxNode | null {
+    if (!TS_JS_CHAIN_LANGUAGES.has(this.language)) return null;
+    const name = getChildByField(declarator, 'name');
+    const value = this.unwrapParens(getChildByField(declarator, 'value'));
+    if (name?.type !== 'identifier' || value?.type !== 'object' || !this.objectHasInlineFunctions(value)) return null;
+    const body = declarator.parent?.parent;
+    const fn = body?.parent;
+    if (body?.type !== 'statement_block' || !fn || !this.isFactoryFunction(fn)) return null;
+    const returned = new Set<string>();
+    const aliases = new Map<string, string>();
+    for (let i = 0; i < body.namedChildCount; i++) {
+      const stmt = body.namedChild(i);
+      if (stmt?.type === 'return_statement') {
+        const r = this.unwrapParens(stmt.namedChild(0));
+        if (r?.type === 'identifier') returned.add(getNodeText(r, this.source));
+      } else if (stmt?.type === 'lexical_declaration' || stmt?.type === 'variable_declaration') {
+        for (let j = 0; j < stmt.namedChildCount; j++) {
+          const d = stmt.namedChild(j);
+          if (d?.type !== 'variable_declarator') continue;
+          const alias = getChildByField(d, 'name');
+          let target = this.unwrapParens(getChildByField(d, 'value'));
+          if (target?.type === 'as_expression' || target?.type === 'satisfies_expression') target = target.namedChild(0);
+          if (alias?.type === 'identifier' && target?.type === 'identifier') {
+            aliases.set(getNodeText(alias, this.source), getNodeText(target, this.source));
+          }
+        }
+      }
+    }
+    for (const r of [...returned]) {
+      let next = aliases.get(r);
+      for (let hop = 0; next && hop < 3; hop++, next = aliases.get(next)) returned.add(next);
+    }
+    return returned.has(getNodeText(name, this.source)) ? value : null;
+  }
+
+  /** A function the graph has a node for — named, or `const f = () => {…}` — and not a class method. */
+  private isFactoryFunction(fn: SyntaxNode): boolean {
+    if (fn.type === 'method_definition' || !this.extractor!.functionTypes.includes(fn.type)) return false;
+    return extractName(fn, this.source, this.extractor!) !== '<anonymous>' || this.declaratorBoundFunction(fn);
+  }
+
+  private unwrapParens(node: SyntaxNode | null): SyntaxNode | null {
+    while (node?.type === 'parenthesized_expression') node = node.namedChild(0);
+    return node;
+  }
+
   /** True if an object literal has ≥1 inline function member (`key: () => …` /
    *  `method(){}`) — distinguishes an inline action map (zustand/SvelteKit form
    *  actions) from a Pinia SETUP store's all-shorthand `return { foo, bar }`
@@ -5708,6 +5786,27 @@ export class TreeSitterExtractor {
       ) {
         const ownerId = this.nodeStack[this.nodeStack.length - 1];
         if (ownerId) this.extractVariableTypeAnnotation(node, ownerId);
+      }
+
+      // A factory's returned object of functions — `function issueService(db) {
+      // …; return { getById: async (id) => {…}, list() {…} } }`. Each inline
+      // function becomes a node named by its key under the factory
+      // (`issueService::getById`), so `svc.getById()` has something to link
+      // to; the other members are walked for calls as usual.
+      // Also the object bound first and returned by name: `const service =
+      // {…}; return service;` (or through `const api = service as Api;
+      // return api;`).
+      const factoryObject =
+        nodeType === 'return_statement' ? this.factoryReturnedObject(node)
+        : nodeType === 'variable_declarator' ? this.factoryReturnedLocalObject(node)
+        : null;
+      if (factoryObject) {
+        this.extractObjectLiteralFunctions(factoryObject);
+        for (let i = 0; i < factoryObject.namedChildCount; i++) {
+          const member = factoryObject.namedChild(i);
+          if (member && !this.isInlineObjectFunction(member)) visitForCallsAndStructure(member);
+        }
+        return;
       }
 
       // Nested NAMED functions inside a body — function declarations and named

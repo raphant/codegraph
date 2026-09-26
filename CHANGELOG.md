@@ -149,6 +149,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- **JavaScript and TypeScript service factories are linked.** A factory like `function issueService(db) { return { getById: async (id) => … } }` returned its functions inside an object, so they were not symbols, and `svc.getById()` after `const svc = issueService(db)` linked to nothing, or to an unrelated class with a `getById` method. Those returned functions are now symbols (also when the object is built first and returned by name, or an entry renames a function), calls through the bound variable link to them, and a `Map` or `Set` variable declared in an outer function no longer links to a project class's `get` or `set`.
+
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - **CodeIgniter model and library calls are linked.** A call like `$this->attendance_model->mark_present()` goes through a property CodeIgniter's loader creates at runtime, so nothing declared its type and the call was never linked — callers, impact and the blast radius in `codegraph_explore` said nothing used those methods. CodeIgniter projects now link these calls to the model or library they load.

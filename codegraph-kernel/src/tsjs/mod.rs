@@ -85,6 +85,29 @@ fn is_function_type(kind: &str) -> bool {
     matches!(kind, "function_declaration" | "generator_function_declaration" | "arrow_function" | "function_expression" | "generator_function")
 }
 
+fn unwrap_parens(mut node: Option<Node>) -> Option<Node> {
+    while let Some(n) = node {
+        if n.kind() != "parenthesized_expression" {
+            return Some(n);
+        }
+        node = n.named_child(0);
+    }
+    None
+}
+
+/// An object member that is an inline function: `key: () => …`,
+/// `key: function () {…}`, or method shorthand `key() {…}`.
+fn is_inline_object_function(member: Node) -> bool {
+    match member.kind() {
+        "method_definition" => true,
+        "pair" => member
+            .child_by_field_name("value")
+            .map(|v| matches!(v.kind(), "arrow_function" | "function_expression"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn is_class_type(v: Variant, kind: &str) -> bool {
     kind == "class_declaration" || (v.is_ts() && kind == "abstract_class_declaration")
 }
@@ -738,6 +761,29 @@ impl<'t> Walker<'t> {
             self.extract_variable_type_annotation(node, owner);
         }
 
+        // A factory's returned object of functions (`return { getById: async
+        // (id) => {…} }`): each inline function becomes a node named by its key
+        // under the factory; the other members are walked for calls. Mirrors
+        // TreeSitterExtractor's factoryReturnedObject.
+        // Also `const service = {…}; return service;`. Mirrors
+        // factoryReturnedLocalObject.
+        let factory_object = match kind {
+            "return_statement" => self.factory_returned_object(node),
+            "variable_declarator" => self.factory_returned_local_object(node),
+            _ => None,
+        };
+        if let Some(obj) = factory_object {
+            self.extract_object_literal_functions(obj);
+            for i in 0..obj.named_child_count() {
+                if let Some(m) = obj.named_child(i) {
+                    if !is_inline_object_function(m) {
+                        self.visit_for_calls_and_structure(m);
+                    }
+                }
+            }
+            return;
+        }
+
         // Nested NAMED functions become their own nodes — and so does the
         // function a React handler hook binds a name to (`const onPress =
         // useCallback(() => {…}, [])`). Mirrors TreeSitterExtractor's
@@ -779,6 +825,99 @@ impl<'t> Walker<'t> {
                 self.visit_for_calls_and_structure(c);
             }
         }
+    }
+
+    /// The object a `return` hands back when it is a factory's object of
+    /// functions: an object literal with an inline function, returned from a
+    /// function that has a node of its own (named, or `const f = () => {…}`).
+    /// Anonymous callbacks and class methods give None.
+    fn factory_returned_object(&self, ret: Node<'t>) -> Option<Node<'t>> {
+        let value = unwrap_parens(ret.named_child(0))?;
+        if value.kind() != "object" || !self.object_has_inline_functions(value) {
+            return None;
+        }
+        let mut current = ret.parent();
+        while let Some(f) = current {
+            if f.kind() == "method_definition" || is_function_type(f.kind()) {
+                break;
+            }
+            current = f.parent();
+        }
+        if self.is_factory_function(current?) { Some(value) } else { None }
+    }
+
+    /// The object of a `const NAME = {…}` directly in a factory's body that
+    /// the factory returns (`return NAME;`, or `return ALIAS;` after
+    /// `const ALIAS = NAME as Api;`).
+    fn factory_returned_local_object(&self, declarator: Node<'t>) -> Option<Node<'t>> {
+        let name = declarator.child_by_field_name("name")?;
+        let value = unwrap_parens(declarator.child_by_field_name("value"))?;
+        if name.kind() != "identifier" || value.kind() != "object" || !self.object_has_inline_functions(value) {
+            return None;
+        }
+        let body = declarator.parent()?.parent()?;
+        let f = body.parent()?;
+        if body.kind() != "statement_block" || !self.is_factory_function(f) {
+            return None;
+        }
+        let mut returned: Vec<&str> = Vec::new();
+        let mut aliases: Vec<(&str, &str)> = Vec::new();
+        for i in 0..body.named_child_count() {
+            let Some(stmt) = body.named_child(i) else { continue };
+            match stmt.kind() {
+                "return_statement" => {
+                    if let Some(r) = unwrap_parens(stmt.named_child(0)) {
+                        if r.kind() == "identifier" {
+                            returned.push(self.text(r));
+                        }
+                    }
+                }
+                "lexical_declaration" | "variable_declaration" => {
+                    for j in 0..stmt.named_child_count() {
+                        let Some(d) = stmt.named_child(j) else { continue };
+                        if d.kind() != "variable_declarator" {
+                            continue;
+                        }
+                        let alias = d.child_by_field_name("name");
+                        let mut target = unwrap_parens(d.child_by_field_name("value"));
+                        if let Some(t) = target {
+                            if matches!(t.kind(), "as_expression" | "satisfies_expression") {
+                                target = t.named_child(0);
+                            }
+                        }
+                        if let (Some(a), Some(t)) = (alias, target) {
+                            if a.kind() == "identifier" && t.kind() == "identifier" {
+                                aliases.push((self.text(a), self.text(t)));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let lookup = |n: &str| aliases.iter().rev().find(|(a, _)| *a == n).map(|(_, t)| *t);
+        for r in returned.clone() {
+            let mut next = lookup(r);
+            let mut hop = 0;
+            while let Some(t) = next {
+                if hop >= 3 {
+                    break;
+                }
+                returned.push(t);
+                next = lookup(t);
+                hop += 1;
+            }
+        }
+        if returned.contains(&self.text(name)) { Some(value) } else { None }
+    }
+
+    /// A function the graph has a node for (named, or `const f = () => {…}`),
+    /// not a class method.
+    fn is_factory_function(&self, f: Node<'t>) -> bool {
+        if f.kind() == "method_definition" || !is_function_type(f.kind()) {
+            return false;
+        }
+        self.extract_name(f) != "<anonymous>" || self.declarator_bound_function(f)
     }
 
     // --- name / signature / modifier helpers ------------------------------------

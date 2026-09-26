@@ -124,6 +124,49 @@ function nested(holder) {
     expect(result.unresolvedReferences.some((r) => r.referenceName === 'values.get')).toBe(true);
   });
 
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('a factory\'s returned object of functions becomes member nodes: %s', (ext, language) => {
+    const result = assertParity(`fixture.${ext}`, `
+function helper() { return 1; }
+export function issueService(db) {
+  function inner() { return helper(); }
+  const rows = [1].map((r) => { return { skip: () => r }; });
+  return {
+    inner,
+    count: helper(),
+    getById: async (id) => helper(),
+    list() { return inner(); },
+    remove: function () { return 0; },
+  };
+}
+const makeStore = () => { return { reset: () => helper() }; };
+class Box { open() { return { close: () => 1 }; } }
+function pipelineService(db) {
+  const service = { run: () => helper(), stop() { return 1; } };
+  const api = service;
+  return api;
+}
+function notReturned() {
+  const local = { skip: () => 1 };
+  return 1;
+}
+`, language);
+    const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.qualifiedName).sort();
+    expect(fns).toEqual([
+      'helper', 'issueService', 'issueService::getById', 'issueService::inner',
+      'issueService::list', 'issueService::remove', 'makeStore', 'makeStore::reset',
+      'notReturned', 'pipelineService', 'pipelineService::run', 'pipelineService::stop',
+    ]);
+    const getById = result.nodes.find((n) => n.qualifiedName === 'issueService::getById')!;
+    const factory = result.nodes.find((n) => n.qualifiedName === 'issueService')!;
+    const callsFrom = (id: string) => result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === id).map((r) => r.referenceName);
+    expect(callsFrom(getById.id)).toEqual(['helper']);
+    // `count: helper()` is not a function member: its call stays on the factory.
+    expect(callsFrom(factory.id)).toContain('helper');
+  });
+
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {
     const file = path.join(FIXTURE_DIR, 'torture.tsx');
     assertParity('fixtures/torture.tsx', fs.readFileSync(file, 'utf8'), 'tsx');
