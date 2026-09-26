@@ -2729,7 +2729,9 @@ program
         success('Telemetry disabled. Buffered, unsent data was deleted.');
       }
       const effective = t.getStatus();
-      if (effective.decidedBy === 'DO_NOT_TRACK' || effective.decidedBy === 'CODEGRAPH_TELEMETRY') {
+      if (effective.decidedBy === 'build') {
+        warn('This build has telemetry turned off in its source — nothing is sent, whatever you choose.');
+      } else if (effective.decidedBy === 'DO_NOT_TRACK' || effective.decidedBy === 'CODEGRAPH_TELEMETRY') {
         warn(
           `The ${effective.decidedBy} environment variable overrides this choice — ` +
           `effective state right now: ${effective.enabled ? 'enabled' : 'disabled'}.`
@@ -2745,6 +2747,7 @@ program
 
     const s = t.getStatus();
     const decidedBy: Record<typeof s.decidedBy, string> = {
+      build: 'turned off in this build',
       DO_NOT_TRACK: 'DO_NOT_TRACK environment variable',
       CODEGRAPH_TELEMETRY: 'CODEGRAPH_TELEMETRY environment variable',
       config: 'your saved choice',

@@ -11,7 +11,7 @@ describe('telemetry opt-out across running instances (#1869)', () => {
   const make = (env = {}, fetchImpl: typeof fetch = async (_url, init) => {
     sends.push(JSON.parse(String(init?.body)));
     return new Response(null, { status: 204 });
-  }) => new Telemetry({ dir, env, fetchImpl, now: () => now, stderr: () => {}, installExitHook: false });
+  }) => new Telemetry({ dir, env, fetchImpl, now: () => now, stderr: () => {}, installExitHook: false, allowTelemetry: true });
   const queued = () => fs.readdirSync(dir).filter(n => n.startsWith('telemetry-queue'));
   beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-telemetry-off-')); now = new Date('2026-06-12T08:00:00Z'); sends = []; });
   afterEach(() => { vi.useRealTimers(); fs.rmSync(dir, { recursive: true, force: true }); });

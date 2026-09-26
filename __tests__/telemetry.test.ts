@@ -37,6 +37,7 @@ describe('Telemetry', () => {
       env: {},
       stderr: (line) => stderrLines.push(line),
       installExitHook: false,
+      allowTelemetry: true,
       ...overrides,
     });
 
@@ -290,5 +291,18 @@ describe('Telemetry', () => {
 
   it('getTelemetry returns a process-wide singleton', () => {
     expect(getTelemetry()).toBe(getTelemetry());
+  });
+
+  it('raphant fork: stays off without allowTelemetry, whatever env or saved choice says', async () => {
+    make().setEnabled(true, 'cli');
+    const fetchImpl = mockFetch(calls);
+    const t = make({ allowTelemetry: undefined, env: { CODEGRAPH_TELEMETRY: '1' }, fetchImpl });
+    expect(t.getStatus()).toMatchObject({ enabled: false, decidedBy: 'build' });
+    t.recordLifecycle('install', {});
+    t.recordUsage('mcp_tool', 'codegraph_explore', true);
+    nowValue = new Date('2026-06-14T08:00:00.000Z');
+    await t.flushNow();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fs.readdirSync(dir).filter((n) => n.startsWith('telemetry-queue'))).toEqual([]);
   });
 });

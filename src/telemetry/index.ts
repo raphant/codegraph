@@ -97,7 +97,7 @@ interface ConfigFile {
 export interface TelemetryStatus {
   enabled: boolean;
   /** What decided the current state — mirrors the precedence order. */
-  decidedBy: 'DO_NOT_TRACK' | 'CODEGRAPH_TELEMETRY' | 'config' | 'default';
+  decidedBy: 'build' | 'DO_NOT_TRACK' | 'CODEGRAPH_TELEMETRY' | 'config' | 'default';
   machineId: string | null;
   configPath: string;
 }
@@ -130,6 +130,12 @@ export interface TelemetryOptions {
   stderr?: (line: string) => void;
   /** Tests opt out so short-lived instances don't pile onto process 'exit'. */
   installExitHook?: boolean;
+  /**
+   * raphant fork: telemetry is off in this build. Only tests pass `true`, to
+   * exercise the send path. The CLI singleton never does, so no env var or
+   * saved choice can turn telemetry on.
+   */
+  allowTelemetry?: boolean;
 }
 
 // One process-level 'exit' listener for ALL instances (in practice: the
@@ -154,6 +160,7 @@ export class Telemetry {
   private readonly now: () => Date;
   private readonly env: NodeJS.ProcessEnv;
   private readonly writeStderr: (line: string) => void;
+  private readonly allowTelemetry: boolean;
 
   private counts = new Map<string, CountLine>();
   private events: EventLine[] = [];
@@ -169,6 +176,7 @@ export class Telemetry {
     this.env = opts.env ?? process.env;
     this.writeStderr = opts.stderr ?? ((line) => process.stderr.write(line));
     this.installExitHook = opts.installExitHook ?? true;
+    this.allowTelemetry = opts.allowTelemetry ?? false;
   }
 
   // ---------------------------------------------------------------- consent
@@ -182,11 +190,16 @@ export class Telemetry {
 
   /**
    * Resolution order (first match wins) — keep in sync with TELEMETRY.md:
-   * DO_NOT_TRACK=1 > CODEGRAPH_TELEMETRY=0|1 > stored config > default on.
+   * this build (off unless `allowTelemetry`) > DO_NOT_TRACK=1 >
+   * CODEGRAPH_TELEMETRY=0|1 > stored config > default on.
    */
   getStatus(): TelemetryStatus {
     const config = this.readConfig();
     const machineId = config?.machine_id ?? null;
+    if (!this.allowTelemetry) {
+      this.clearPending();
+      return { enabled: false, decidedBy: 'build', machineId, configPath: this.configPath };
+    }
     const dnt = this.env.DO_NOT_TRACK;
     if (dnt !== undefined && dnt !== '' && dnt !== '0' && dnt.toLowerCase() !== 'false') {
       this.clearPending();
