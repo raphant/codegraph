@@ -25,6 +25,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- A new `codegraph_feedback` MCP tool lets an agent report where codegraph was wrong or missing something, with the `file:line` that proves it; each report is saved as a Markdown file in a feedback inbox (`CODEGRAPH_FEEDBACK_DIR`, or the project's `.codegraph/feedback/`) for review.
+
 - **Index a hand-written file bigger than 1 MB.** Files over 1 MB are skipped to keep generated bundles out, which also hid every function in a big hand-written file. Set `maxFileSizeMB` in `codegraph.json` to raise the limit, and the skipped-file warning now names that setting.
 
 - **RimWorld mods: XML Defs link to the C# classes they name.** A mod's window, building and comp classes are named only in XML (`<tabWindowClass>`, `<thingClass>`, `<li Class="…">`) and created by the game at runtime, so the graph showed them as unused and a rename looked safe. Each Def is now a symbol named by its `defName`, linked to the project classes it names, so callers and impact show the XML that depends on a class.

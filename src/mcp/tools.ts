@@ -40,6 +40,9 @@ import {
   statSync,
 } from 'fs';
 import { createHash } from 'crypto';
+import { execFileSync } from 'child_process';
+import { FEEDBACK_KINDS, feedbackInboxDir, writeFeedback, type FeedbackKind } from './feedback';
+import { CodeGraphPackageVersion } from './version';
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
@@ -1352,6 +1355,32 @@ export const tools: ToolDefinition[] = [
     _meta: { 'anthropic/alwaysLoad': true },
   },
   {
+    name: 'codegraph_feedback',
+    description: 'Report where codegraph was wrong or missing something, so it gets fixed: a caller the code has but codegraph did not show, a wrong link, a symbol it could not find, an off-topic explore answer, an error. Call it when you SAW the problem in the code — give the file:line that proves it. Takes a second; then carry on with your task.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: {
+          type: 'string',
+          enum: [...FEEDBACK_KINDS],
+          description: 'missing-link (the code calls/uses it, codegraph did not show it), wrong-link (codegraph showed a link the code does not have), missing-symbol, bad-explore (answer off-topic or missing the key code), error-or-slow, idea',
+        },
+        summary: { type: 'string', description: 'One line: what was wrong.' },
+        evidence: {
+          type: 'string',
+          description: 'Proof from the code: file:line spots (e.g. "server/src/routes/agents.ts:7284 calls heartbeat.getRunLogAccess(runId)") or the grep that showed it. Required except for kind=idea.',
+        },
+        symbol: { type: 'string', description: 'The symbol you asked codegraph about, if any.' },
+        expected: { type: 'string', description: 'What codegraph should have returned.' },
+        got: { type: 'string', description: 'What it returned instead.' },
+        reporter: { type: 'string', description: 'Your agent name or role, if you have one.' },
+        projectPath: projectPathProperty,
+      },
+      required: ['kind', 'summary'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
     name: 'codegraph_status',
     description: 'Index health check (files / nodes / edges). Skip unless debugging.',
     inputSchema: {
@@ -1454,7 +1483,7 @@ export function getStaticTools(): ToolDefinition[] {
  * status) remain fully functional — handlers stay, the library API and CLI are
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
-const DEFAULT_MCP_TOOLS = new Set(['explore']);
+const DEFAULT_MCP_TOOLS = new Set(['explore', 'feedback']);
 
 /**
  * Tool handler that executes tools against a CodeGraph instance
@@ -2150,6 +2179,11 @@ export class ToolHandler {
       // auto-banner wrapper to avoid duplicating its own pending-files section.
       if (toolName === 'codegraph_status') {
         return await this.handleStatus(args);
+      }
+      // codegraph_feedback writes a file and needs no index, so it never goes
+      // to a worker and never gets the staleness banners.
+      if (toolName === 'codegraph_feedback') {
+        return this.handleFeedback(args);
       }
 
       // Read tools: off-load the CPU-heavy dispatch to the worker pool when one
@@ -6516,6 +6550,74 @@ export class ToolHandler {
   /**
    * Handle codegraph_status
    */
+  /**
+   * Handle codegraph_feedback: validate the report, add what the review team
+   * needs to reproduce it (build, project commit, the graph's current callers
+   * of `symbol`), and file it in the feedback inbox (see ./feedback.ts). Every
+   * outcome is success-shaped: a missing field comes back as guidance.
+   */
+  private handleFeedback(args: Record<string, unknown>): ToolResult {
+    const kind = args.kind as FeedbackKind;
+    if (!FEEDBACK_KINDS.includes(kind)) {
+      return this.textResult(`Not filed: kind must be one of ${FEEDBACK_KINDS.join(', ')}.`);
+    }
+    const text = (name: string, max = 4000): string | undefined => {
+      const v = args[name];
+      return typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined;
+    };
+    const summary = text('summary', 300);
+    const evidence = text('evidence', 8000);
+    if (!summary) return this.textResult('Not filed: add a one-line summary.');
+    if (!evidence && kind !== 'idea') {
+      return this.textResult('Not filed: add evidence — the file:line that shows the problem, or the grep that found it. Then call again.');
+    }
+
+    let cg: CodeGraph | null = null;
+    try { cg = this.getCodeGraph(args.projectPath as string | undefined); } catch { /* no index: still file it */ }
+    const projectRoot = cg?.getProjectRoot();
+    const symbol = text('symbol', 200);
+    let graphAnswer: string[] | undefined;
+    if (cg && symbol) {
+      const simple = lastQualifierPart(symbol);
+      graphAnswer = cg.getNodesByName(simple).slice(0, 3).flatMap((def) => {
+        const callers = cg!.getCallers(def.id).slice(0, 15);
+        return [
+          `${def.qualifiedName} (${def.filePath}:${def.startLine}): ${callers.length} caller(s)`,
+          ...callers.map(({ node, edge }) => `  ${node.qualifiedName} — ${node.filePath}:${edge.line ?? node.startLine}`),
+        ];
+      });
+    }
+    let projectCommit: string | undefined;
+    if (projectRoot) {
+      try {
+        projectCommit = execFileSync('git', ['-C', projectRoot, 'rev-parse', '--short', 'HEAD'], {
+          encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim() || undefined;
+      } catch { /* not a git checkout */ }
+    }
+    const build = __dirname.match(/versions[\\/]([^\\/]+)/)?.[1];
+
+    const target = feedbackInboxDir(projectRoot);
+    if (!target) {
+      return this.textResult('Not filed: no feedback inbox here (set CODEGRAPH_FEEDBACK_DIR) and no project to save it in. Carry on with your task.');
+    }
+    try {
+      const file = writeFeedback(target.dir, {
+        kind, summary, evidence: evidence ?? '', symbol,
+        expected: text('expected'), got: text('got'), reporter: text('reporter', 100),
+      }, {
+        codegraphVersion: build ? `${CodeGraphPackageVersion} (${build})` : CodeGraphPackageVersion,
+        projectRoot, projectCommit, graphAnswer,
+      });
+      return this.textResult(
+        `Filed: ${file}${target.shared ? '' : ' (project-local: the shared inbox was not reachable)'}\n` +
+        'Thanks. For this case, rely on the code itself (Read/Grep) and carry on with your task.'
+      );
+    } catch (err) {
+      return this.textResult(`Not filed: could not write to ${target.dir} (${err instanceof Error ? err.message : String(err)}). Carry on with your task.`);
+    }
+  }
+
   private async handleStatus(args: Record<string, unknown>): Promise<ToolResult> {
     let cg = this.getCodeGraph(args.projectPath as string | undefined);
     // Same trick as withStalenessNotice — when an explicit projectPath

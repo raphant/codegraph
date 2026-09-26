@@ -1,8 +1,8 @@
 /**
  * Read-only MCP ToolAnnotations on every codegraph tool (issue #1018).
  *
- * Every codegraph tool is query-only — it reads the pre-built index and never
- * mutates the workspace. Clients gate on this: Cursor's Ask mode refuses any MCP
+ * Every codegraph query tool is query-only — it reads the pre-built index and never
+ * mutates the workspace (the fork's `codegraph_feedback` only adds a report file). Clients gate on this: Cursor's Ask mode refuses any MCP
  * tool that doesn't advertise `readOnlyHint: true`, so without annotations the
  * codegraph tools were blocked there even though they only read.
  *
@@ -26,9 +26,17 @@ import { CodeGraph } from '../src';
 const ENV = 'CODEGRAPH_MCP_TOOLS';
 const ALL_TOOLS = tools.map((t) => t.name).join(',');
 
-/** Assert a single tool advertises the full read-only contract from #1018. */
+/**
+ * Assert a single tool advertises the full read-only contract from #1018.
+ * `codegraph_feedback` is the one exception: it writes a report file into the
+ * feedback inbox, so it says so, but it never changes or deletes anything.
+ */
 function expectReadOnly(tool: ToolDefinition): void {
   expect(tool.annotations, `${tool.name} is missing annotations`).toBeDefined();
+  if (tool.name === 'codegraph_feedback') {
+    expect(tool.annotations).toEqual({ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false });
+    return;
+  }
   // The hint Cursor Ask mode (and other clients) gate on.
   expect(tool.annotations!.readOnlyHint).toBe(true);
   // The exact triplet the issue asks for, plus the honest closed-world hint.

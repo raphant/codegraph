@@ -12,8 +12,9 @@
  *   - Anti-patterns (don't re-verify with grep; don't hand-reconstruct flows)
  *
  * Keep it tight. The agent reads this every session — long instructions
- * burn tokens. The DEFAULT MCP surface is `codegraph_explore` ALONE (see
- * DEFAULT_MCP_TOOLS in tools.ts) — reference only that tool here. The other
+ * burn tokens. The DEFAULT MCP surface is `codegraph_explore` plus
+ * `codegraph_feedback` (see DEFAULT_MCP_TOOLS in tools.ts) — reference only
+ * those two here. The other
  * tools (node/search/callers/…) stay defined and are re-enablable via
  * CODEGRAPH_MCP_TOOLS, but they are NOT listed to agents, so don't name them.
  */
@@ -74,6 +75,10 @@ calls; a grep/read exploration is dozens.
 - Index lags file writes by ~1 second.
 - Cross-file resolution is best-effort name matching; ambiguous calls may return multiple candidates.
 - No live correctness validation — that's still the TypeScript compiler / test suite / linter's job. Codegraph supplements those with structural context they don't have.
+
+## When codegraph is wrong
+
+If the code shows codegraph missed something or got it wrong — a caller it did not list, a link that is not there, a symbol it could not find, an off-topic answer — call \`codegraph_feedback\` once with the file:line that proves it, then carry on. Each report is reviewed and turned into a fix or a new rule.
 `;
 
 /**
