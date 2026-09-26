@@ -36,6 +36,7 @@ import { expoRouterResolver } from './expo-router';
 import { fabricViewResolver } from './fabric';
 import { cicsResolver } from './cics';
 import { terraformResolver } from './terraform';
+import { rimworldResolver } from './rimworld';
 
 /**
  * All registered framework resolvers
@@ -97,6 +98,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   cicsResolver,
   // Terraform / OpenTofu — disambiguate var/local/module/resource refs to same-dir module
   terraformResolver,
+  // RimWorld mods — XML Defs → the C# classes they name (`<thingClass>`, `Class="…"`)
+  rimworldResolver,
 ];
 
 /**
@@ -155,6 +158,7 @@ export function registerFrameworkResolver(resolver: FrameworkResolver): void {
 export { drupalResolver } from './drupal';
 export { laravelResolver, FACADE_MAPPINGS } from './laravel';
 export { codeigniterResolver } from './codeigniter';
+export { rimworldResolver } from './rimworld';
 export { expressResolver } from './express';
 export { nestjsResolver } from './nestjs';
 export { reactResolver } from './react';
